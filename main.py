@@ -11,6 +11,7 @@ from fcmeans import FCM
 from scipy import stats
 from sklearn.metrics import f1_score, precision_score, recall_score
 
+
 def SeleccionarComponentes(MatrizCaracterizacion, Etiquetas1, Etiquetas2):
     """
     Selecciona componentes con diferencias significativas entre dos grupos
@@ -60,6 +61,39 @@ def SeleccionarComponentes(MatrizCaracterizacion, Etiquetas1, Etiquetas2):
     else:
         return None, None
     
+def assign_clusters_to_classes(fcm_model, X, y_true):
+    u = fcm_model.u
+    n_clusters = fcm_model.n_clusters
+    cluster_classes = []
+    class_labels = np.unique(y_true)
+    
+    # Calcular afinidad por clase para cada cluster
+    for k in range(n_clusters):
+        class_scores = []
+        for cls in class_labels:
+            # Ponderación que considera pertenencia y balance de clases
+            mask = (y_true == cls)
+            class_score = np.sum(u[mask, k]) * (1 + np.sum(mask)/len(y_true))
+            class_scores.append(class_score)
+        
+        cluster_classes.append(class_labels[np.argmax(class_scores)])
+    
+    # Garantizar que ambas clases estén representadas
+    if len(np.unique(cluster_classes)) < len(class_labels):
+        # Calcular entropía de cada cluster
+        cluster_entropy = []
+        for k in range(n_clusters):
+            pk = u[:, k] / (np.sum(u[:, k]) + 1e-10)
+            entropy = -np.sum(pk * np.log(pk + 1e-10))
+            cluster_entropy.append(entropy)
+        
+        # Reasignar el cluster más incierto
+        most_uncertain = np.argmax(cluster_entropy)
+        missing_class = [c for c in class_labels if c not in cluster_classes][0]
+        cluster_classes[most_uncertain] = missing_class
+    
+    return cluster_classes
+
 def AnalisisDeCorrelacion(MatrizCaracterizacion):
     """
     Analiza la correlación entre las características de la matriz de caracterización.
@@ -97,6 +131,7 @@ def AnalisisDeCorrelacion(MatrizCaracterizacion):
         print(f"Características restantes: {MatrizCaracterizacion.shape[1]}")
     
     return MatrizCaracterizacion
+
 def CargarDatos():
     """
     Carga los datos desde un archivo Excel y prepara las características y etiquetas para el modelo de aprendizaje automático.
@@ -126,14 +161,102 @@ def CargarDatos():
     X = np.concatenate((X[indices_clase1], X[indices_clase2]), axis=0)
     y = np.concatenate((y[indices_clase1], y[indices_clase2]), axis=0)
     
-    #se analiza la correlacion entre las caracteristicas
-    X = AnalisisDeCorrelacion(X)
-    
     X, _ = SeleccionarComponentes(X, y_clase1, y_clase2)
     if X is None:
         print("No se seleccionaron componentes significativos.")
         return None, None
+    
+    #se analiza la correlacion entre las caracteristicas
+    X = AnalisisDeCorrelacion(X)
+    
+
     return X, y
+
+def optimizar_parametro_modelo(model_class, param_name, valores, X, y_true, assign_clusters_to_classes, fixed_params=None):
+
+    resultados = []
+
+    fixed_params = fixed_params or {}
+
+    for val in valores:
+        params = {**fixed_params, param_name: val}
+        try:
+            modelo = model_class(**params)
+            modelo.fit(X)
+            cluster_classes = assign_clusters_to_classes(modelo, X, y_true)
+            y_pred = np.array([cluster_classes[c] for c in modelo.predict(X)])
+            
+            error = np.sum([
+                np.min([np.linalg.norm(x - c)**2 for c in modelo.centers])
+                for x in X
+            ]) / len(X)
+            
+            if np.isnan(error):
+                print(f"NaN en error con {param_name}={val}, omitiendo.")
+                continue
+            
+            acc = accuracy_score(y_true, y_pred)
+            f1 = f1_score(y_true, y_pred, average='weighted')
+            prec = precision_score(y_true, y_pred, average='weighted')
+            rec = recall_score(y_true, y_pred, average='weighted')
+
+            resultados.append({
+                param_name: val,
+                'modelo': modelo,
+                'cluster_classes': cluster_classes,
+                'error': error,
+                'accuracy': acc,
+                'f1_score': f1,
+                'precision': prec,
+                'recall': rec
+            })
+
+        except Exception as e:
+            print(f"Error con {param_name}={val}: {e}")
+            continue
+
+    if not resultados:
+        raise RuntimeError(f"No se pudo ajustar ningún modelo con los valores dados para '{param_name}'.")
+
+    # Selección del mejor modelo según función de puntuación
+    def score(r): return r['f1_score']# + r['accuracy']+r['recall'] - r['error']
+    mejor_resultado = max(resultados, key=score)
+    mejor_valor = mejor_resultado[param_name]
+
+    # Graficar métricas vs parámetro
+    xs = [r[param_name] for r in resultados]
+    plt.figure(figsize=(15, 5))
+
+    plt.subplot(1, 3, 1)
+    plt.plot(xs, [r['error'] for r in resultados], 'bo-', label='Error')
+    plt.plot(xs, [r['accuracy'] for r in resultados], 'go-', label='Accuracy')
+    plt.axvline(x=mejor_valor, color='r', linestyle='--')
+    plt.xlabel(param_name)
+    plt.title('Error / Accuracy vs ' + param_name)
+    plt.legend()
+    plt.grid(True)
+
+    plt.subplot(1, 3, 2)
+    plt.plot(xs, [r['f1_score'] for r in resultados], 'mo-', label='F1-score')
+    plt.plot(xs, [r['precision'] for r in resultados], 'co-', label='Precision')
+    plt.axvline(x=mejor_valor, color='r', linestyle='--')
+    plt.xlabel(param_name)
+    plt.title('F1 / Precision vs ' + param_name)
+    plt.legend()
+    plt.grid(True)
+
+    plt.subplot(1, 3, 3)
+    plt.plot(xs, [r['recall'] for r in resultados], 'yo-', label='Recall')
+    plt.axvline(x=mejor_valor, color='r', linestyle='--')
+    plt.xlabel(param_name)
+    plt.title('Recall vs ' + param_name)
+    plt.legend()
+    plt.grid(True)
+
+    plt.tight_layout()
+    plt.show()
+
+    return mejor_resultado
 
 def Punto1(X, y):
     """
@@ -148,7 +271,7 @@ def Punto1(X, y):
     """
     # Split data
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.5, random_state=42,
+        X, y, test_size=0.2, random_state=42,
         stratify=y)
     
     # Scale data
@@ -196,7 +319,7 @@ def Punto2(X, y, AplicarPCA=False):
     
     # 1. Preparación de datos
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y,
+        X, y, test_size=0.5, random_state=42, stratify=y,
         shuffle=True)
     # Escalado de características
     scaler = StandardScaler()
@@ -222,130 +345,26 @@ def Punto2(X, y, AplicarPCA=False):
     plt.scatter(X_reduced_test[:, 0], X_reduced_test[:, 1], c=y_test, cmap='viridis', alpha=0.6)
     plt.title('Datos Originales (Test)')
     plt.colorbar(label='Clase')
-
-    # 2. Función mejorada para asignar clusters a clases
-    def assign_clusters_to_classes(fcm_model, X, y_true):
-        u = fcm_model.u
-        n_clusters = fcm_model.n_clusters
-        cluster_classes = []
-        class_labels = np.unique(y_true)
-        
-        # Calcular afinidad por clase para cada cluster
-        for k in range(n_clusters):
-            class_scores = []
-            for cls in class_labels:
-                # Ponderación que considera pertenencia y balance de clases
-                mask = (y_true == cls)
-                class_score = np.sum(u[mask, k]) * (1 + np.sum(mask)/len(y_true))
-                class_scores.append(class_score)
-            
-            cluster_classes.append(class_labels[np.argmax(class_scores)])
-        
-        # Garantizar que ambas clases estén representadas
-        if len(np.unique(cluster_classes)) < len(class_labels):
-            # Calcular entropía de cada cluster
-            cluster_entropy = []
-            for k in range(n_clusters):
-                pk = u[:, k] / (np.sum(u[:, k]) + 1e-10)
-                entropy = -np.sum(pk * np.log(pk + 1e-10))
-                cluster_entropy.append(entropy)
-            
-            # Reasignar el cluster más incierto
-            most_uncertain = np.argmax(cluster_entropy)
-            missing_class = [c for c in class_labels if c not in cluster_classes][0]
-            cluster_classes[most_uncertain] = missing_class
-        
-        return cluster_classes
-
-    # 3. Evaluación de modelos - Añadimos nuevas métricas
-    results = []
-    for k in range(2, 50):
-        fcm = FCM(n_clusters=k, m=2, max_iter=1000, random_state=42)
-        fcm.fit(X_train)
-        
-        cluster_classes = assign_clusters_to_classes(fcm, X_train, y_train)
-        y_train_pred = np.array([cluster_classes[c] for c in fcm.predict(X_train)])
-        
-        # Cálculo de métricas
-        error = np.sum([np.min([np.linalg.norm(x - c)**2 for c in fcm.centers]) for x in X_train]) / len(X_train)
-        accuracy = accuracy_score(y_train, y_train_pred)
-        f1 = f1_score(y_train, y_train_pred, average='weighted')  # F1-score ponderado
-        precision = precision_score(y_train, y_train_pred, average='weighted')
-        recall = recall_score(y_train, y_train_pred, average='weighted')
-        
-        results.append({
-            'k': k,
-            'error': error,
-            'accuracy': accuracy,
-            'f1_score': f1,
-            'precision': precision,
-            'recall': recall,
-            'cluster_classes': cluster_classes
-        })
-
-    # 4. Selección del mejor modelo - Ahora considerando F1-score
-    valid_models = [r for r in results if len(np.unique(r['cluster_classes'])) == 2]
-    
-    if not valid_models:
-        print("Advertencia: Ningún modelo capturó ambas clases. Usando el mejor modelo disponible.")
-        valid_models = results
-    
-    # Nueva función de scoring que prioriza F1-score
-    def model_score(model):
-        return model['f1_score'] + model['accuracy'] - model['error']
-    
-    optimal_model = max(valid_models, key=model_score)
-    optimal_k = optimal_model['k']
-    
-    print("\nRESUMEN DE SELECCIÓN DE MODELO:")
-    print(f"Número óptimo de clusters: {optimal_k}")
-    print(f"Asignación clusters-clases: {optimal_model['cluster_classes']}")
-    print(f"Métricas de entrenamiento:")
-    print(f"- Error: {optimal_model['error']:.4f}")
-    print(f"- Accuracy: {optimal_model['accuracy']:.2%}")
-    print(f"- F1-score: {optimal_model['f1_score']:.4f}")
-    print(f"- Precision: {optimal_model['precision']:.4f}")
-    print(f"- Recall: {optimal_model['recall']:.4f}")
-
-    # 5. Gráficos de métricas - Añadimos F1-score
-    plt.figure(figsize=(15, 5))
-    
-    # Gráfico de Error y Accuracy
-    plt.subplot(1, 3, 1)
-    plt.plot([r['k'] for r in results], [r['error'] for r in results], 'bo-', label='Error')
-    plt.plot([r['k'] for r in results], [r['accuracy'] for r in results], 'go-', label='Accuracy')
-    plt.xlabel('Número de Clusters')
-    plt.ylabel('Valor')
-    plt.title('Error y Accuracy vs Número de Clusters')
-    plt.axvline(x=optimal_k, color='r', linestyle='--')
-    plt.legend()
+    plt.xlabel('Componente Principal 1')
+    plt.ylabel('Componente Principal 2')
     plt.grid(True)
-    
-    # Gráfico de F1-score
-    plt.subplot(1, 3, 2)
-    plt.plot([r['k'] for r in results], [r['f1_score'] for r in results], 'mo-')
-    plt.xlabel('Número de Clusters')
-    plt.ylabel('F1-score')
-    plt.title('F1-score vs Número de Clusters')
-    plt.axvline(x=optimal_k, color='r', linestyle='--')
-    plt.grid(True)
-    
-    # Gráfico de Precision-Recall
-    plt.subplot(1, 3, 3)
-    plt.plot([r['k'] for r in results], [r['precision'] for r in results], 'co-', label='Precision')
-    plt.plot([r['k'] for r in results], [r['recall'] for r in results], 'yo-', label='Recall')
-    plt.xlabel('Número de Clusters')
-    plt.ylabel('Valor')
-    plt.title('Precision y Recall vs Número de Clusters')
-    plt.axvline(x=optimal_k, color='r', linestyle='--')
-    plt.legend()
-    plt.grid(True)
-    
-    plt.tight_layout()
     plt.show()
-
-    # 6. Entrenamiento final y evaluación en test
-    final_fcm = FCM(n_clusters=optimal_k, m=1.5, max_iter=1000, random_state=42)
+    #se seleciona el mejor número de clusters
+    optimal_k = optimizar_parametro_modelo(
+        FCM, 'n_clusters',
+        range(1, 20,1), X_train, y_train, assign_clusters_to_classes,
+        fixed_params={'m': 2, 'max_iter': 500, 'random_state': 42}
+    )
+    optimal_k = optimal_k['n_clusters']
+    optimal_m = optimizar_parametro_modelo(
+        FCM, 'm',
+        np.arange(1.1, 3.1, 0.1),
+        X_train, y_train, assign_clusters_to_classes,
+        fixed_params={'n_clusters': optimal_k, 'max_iter': 500, 'random_state': 42}
+    )
+    optimal_m = optimal_m['m']
+    # 6. Entrenamiento final con los mejores parámetros (k y m)
+    final_fcm = FCM(n_clusters=optimal_k, m=optimal_m, max_iter=1000, random_state=42)
     final_fcm.fit(X_train)
     final_cluster_classes = assign_clusters_to_classes(final_fcm, X_train, y_train)
     
@@ -368,20 +387,10 @@ def Punto2(X, y, AplicarPCA=False):
         centers_reduced = final_fcm.centers
     plt.scatter(centers_reduced[:, 0], centers_reduced[:, 1], 
                 marker='X', s=1, c='red', label='Centroides')
-    plt.title(f'Resultado Final (k={optimal_k})\nAccuracy: {test_accuracy:.2%} | F1: {test_f1:.2f}\nPrecision: {test_precision:.2f} | Recall: {test_recall:.2f}')
+    plt.title(f'Resultado Final (k={optimal_k}, m={optimal_m:.2f})\nAccuracy: {test_accuracy:.2%} | F1: {test_f1:.2f}\nPrecision: {test_precision:.2f} | Recall: {test_recall:.2f}')
     plt.colorbar(scatter, label='Clase Predicha')
     plt.legend()
     plt.show()
-
-    # 8. Reporte final completo
-    print("\nREPORTE FINAL:")
-    print(f"Mejor modelo con k={optimal_k} clusters")
-    print("\nMétricas en Train:")
-    print(f"- Error: {optimal_model['error']:.4f}")
-    print(f"- Accuracy: {optimal_model['accuracy']:.2%}")
-    print(f"- F1-score: {optimal_model['f1_score']:.4f}")
-    print(f"- Precision: {optimal_model['precision']:.4f}")
-    print(f"- Recall: {optimal_model['recall']:.4f}")
     
     print("\nMétricas en Test:")
     print(f"- Error: {test_error:.4f}")
@@ -398,4 +407,5 @@ X, y = CargarDatos()
 #se divide el dataset en un 80% para entrenamiento y un 20% para test
 
 #Punto1(X, y)
+Punto2(X, y)
 Punto2(X, y, AplicarPCA=True)
